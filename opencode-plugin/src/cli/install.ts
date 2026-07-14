@@ -1,0 +1,443 @@
+import { existsSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
+import {
+  detectBackgroundSubagentsTarget,
+  expandHomePath,
+  getBackgroundSubagentsBlock,
+  isBackgroundSubagentsEnabled,
+  manualBackgroundSubagentsInstructions,
+  writeBackgroundSubagentsBlock,
+} from './background-subagents';
+import { syncBundledSkillsFromPackage } from './bundled-skill-sync';
+import {
+  addPluginToOpenCodeConfig,
+  addPluginToOpenCodeTuiConfig,
+  detectCurrentConfig,
+  disableDefaultAgents,
+  enableLspByDefault,
+  generateLiteConfig,
+  getLocalSchemaUrl,
+  getOpenCodePath,
+  getOpenCodeVersion,
+  isOpenCodeInstalled,
+  writeLiteConfig,
+} from './config-manager';
+import { CUSTOM_SKILLS } from './custom-skills';
+import { getExistingLiteConfigPath } from './paths';
+import type { ConfigMergeResult, InstallArgs, InstallConfig } from './types';
+
+// Colors
+const GREEN = '\x1b[32m';
+const BLUE = '\x1b[34m';
+const RED = '\x1b[31m';
+const BOLD = '\x1b[1m';
+const DIM = '\x1b[2m';
+const RESET = '\x1b[0m';
+
+const SYMBOLS = {
+  check: `${GREEN}[ok]${RESET}`,
+  cross: `${RED}[x]${RESET}`,
+  arrow: `${BLUE}->${RESET}`,
+  bullet: `${DIM}-${RESET}`,
+  info: `${BLUE}[i]${RESET}`,
+};
+
+function printHeader(isUpdate: boolean): void {
+  console.log();
+  console.log(
+    `${BOLD}opencode-multi-agent ${isUpdate ? 'Update' : 'Install'}${RESET}`,
+  );
+  console.log('='.repeat(30));
+  console.log();
+}
+
+function printStep(step: number, total: number, message: string): void {
+  console.log(`${DIM}[${step}/${total}]${RESET} ${message}`);
+}
+
+function printSuccess(message: string): void {
+  console.log(`${SYMBOLS.check} ${message}`);
+}
+
+function printError(message: string): void {
+  console.log(`${SYMBOLS.cross} ${RED}${message}${RESET}`);
+}
+
+function printInfo(message: string): void {
+  console.log(`${SYMBOLS.info} ${message}`);
+}
+
+async function confirm(message: string, defaultYes = true): Promise<boolean> {
+  const suffix = defaultYes ? ' (Y/n) ' : ' (y/N) ';
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  try {
+    const answer = (await rl.question(`${message}${suffix}`))
+      .trim()
+      .toLowerCase();
+    if (!answer) return defaultYes;
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+async function checkOpenCodeInstalled(): Promise<{
+  ok: boolean;
+  version?: string;
+  path?: string;
+}> {
+  const installed = await isOpenCodeInstalled();
+  if (!installed) {
+    printError('OpenCode is not installed on this system.');
+    printInfo('Install it with:');
+    console.log(
+      `     ${BLUE}curl -fsSL https://opencode.ai/install | bash${RESET}`,
+    );
+    console.log();
+    printInfo('Or if already installed, add it to your PATH:');
+    console.log(`     ${BLUE}export PATH="$HOME/.local/bin:$PATH"${RESET}`);
+    console.log(`     ${BLUE}export PATH="$HOME/.opencode/bin:$PATH"${RESET}`);
+    return { ok: false };
+  }
+  const version = await getOpenCodeVersion();
+  const path = getOpenCodePath();
+  const detectedVersion = version ?? '';
+  const pathInfo = path ? ` (${DIM}${path}${RESET})` : '';
+  printSuccess(`OpenCode ${detectedVersion} detected${pathInfo}`);
+  return { ok: true, version: version ?? undefined, path: path ?? undefined };
+}
+
+export async function configureBackgroundSubagents(
+  config: InstallConfig,
+): Promise<{ enabledNow: boolean; configuredTarget?: string }> {
+  if (
+    isBackgroundSubagentsEnabled(
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS,
+    )
+  ) {
+    printSuccess(
+      'OpenCode background subagents already enabled in environment',
+    );
+    return { enabledNow: true };
+  }
+
+  const target =
+    config.backgroundSubagentsTarget !== undefined
+      ? expandHomePath(config.backgroundSubagentsTarget)
+      : detectBackgroundSubagentsTarget();
+
+  if (config.backgroundSubagents === 'no') {
+    printInfo('OpenCode background subagents shell setup skipped.');
+    console.log(manualBackgroundSubagentsInstructions({ targetPath: target }));
+    return { enabledNow: false };
+  }
+
+  if (!target) {
+    printInfo('No safe shell startup file detected.');
+    console.log(manualBackgroundSubagentsInstructions());
+    return { enabledNow: false };
+  }
+
+  const block = getBackgroundSubagentsBlock(target);
+
+  if (config.dryRun) {
+    printInfo(
+      'Dry run mode - background subagents block that would be written:',
+    );
+    console.log(`Target: ${target}`);
+    console.log(`\n${block}\n`);
+    return { enabledNow: false, configuredTarget: target };
+  }
+
+  if (config.backgroundSubagents === 'ask') {
+    if (!process.stdin.isTTY) {
+      printInfo('Skipped background subagents shell setup in non-TTY mode.');
+      console.log(
+        manualBackgroundSubagentsInstructions({ targetPath: target }),
+      );
+      return { enabledNow: false };
+    }
+
+    console.log();
+    printInfo(
+      'V2 requires OpenCode background subagents for default orchestration.',
+    );
+    printInfo(
+      `The installer can add the required environment export to ${target}.`,
+    );
+    const shouldWrite = await confirm(
+      'Add OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true now?',
+      true,
+    );
+    if (!shouldWrite) {
+      printInfo('Skipped background subagents shell setup.');
+      console.log(
+        manualBackgroundSubagentsInstructions({ targetPath: target }),
+      );
+      return { enabledNow: false };
+    }
+  }
+
+  try {
+    writeBackgroundSubagentsBlock(target);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    printError(`Could not write background subagents shell config: ${message}`);
+    printInfo('Add the setting manually instead:');
+    console.log(manualBackgroundSubagentsInstructions({ targetPath: target }));
+    return { enabledNow: false };
+  }
+
+  printSuccess(
+    `Background subagents enabled ${SYMBOLS.arrow} ${DIM}${target}${RESET}`,
+  );
+  return { enabledNow: false, configuredTarget: target };
+}
+
+function handleStepResult(
+  result: ConfigMergeResult,
+  successMsg: string,
+): boolean {
+  if (!result.success) {
+    printError(`Failed: ${result.error}`);
+    return false;
+  }
+  printSuccess(
+    `${successMsg} ${SYMBOLS.arrow} ${DIM}${result.configPath}${RESET}`,
+  );
+  return true;
+}
+
+async function runInstall(config: InstallConfig): Promise<number> {
+  const detected = detectCurrentConfig();
+  const isUpdate = detected.isInstalled;
+
+  printHeader(isUpdate);
+
+  let totalSteps = 7;
+  if (config.installCustomSkills) totalSteps += 1;
+
+  let step = 1;
+
+  printStep(step++, totalSteps, 'Checking OpenCode installation...');
+  if (config.dryRun) {
+    printInfo('Dry run mode - skipping OpenCode check');
+  } else {
+    const { ok } = await checkOpenCodeInstalled();
+    if (!ok) return 1;
+  }
+  printStep(step++, totalSteps, 'Adding opencode-multi-agent plugin...');
+  if (config.dryRun) {
+    printInfo('Dry run mode - skipping plugin installation');
+  } else {
+    const pluginResult = await addPluginToOpenCodeConfig();
+    if (!handleStepResult(pluginResult, 'Plugin added')) return 1;
+  }
+
+  printStep(step++, totalSteps, 'Adding TUI version badge...');
+  if (config.dryRun) {
+    printInfo('Dry run mode - skipping TUI plugin installation');
+  } else {
+    const tuiResult = await addPluginToOpenCodeTuiConfig();
+    if (!tuiResult.success) {
+      printInfo(`Skipped TUI badge: ${tuiResult.error}`);
+    } else {
+      handleStepResult(tuiResult, 'TUI badge added');
+    }
+  }
+
+  printStep(step++, totalSteps, 'Disabling OpenCode default agents...');
+  if (config.dryRun) {
+    printInfo('Dry run mode - skipping agent disabling');
+  } else {
+    const agentResult = disableDefaultAgents();
+    if (!handleStepResult(agentResult, 'Default agents disabled')) return 1;
+  }
+
+  printStep(step++, totalSteps, 'Enabling OpenCode LSP integration...');
+  if (config.dryRun) {
+    printInfo('Dry run mode - skipping LSP configuration');
+  } else {
+    const lspResult = enableLspByDefault();
+    if (!handleStepResult(lspResult, 'LSP enabled')) return 1;
+  }
+
+  printStep(step++, totalSteps, 'Configuring OpenCode background subagents...');
+  const backgroundSubagents = await configureBackgroundSubagents(config);
+
+  printStep(
+    step++,
+    totalSteps,
+    'Writing opencode-multi-agent configuration...',
+  );
+  if (config.dryRun) {
+    const liteConfig = generateLiteConfig(config, getLocalSchemaUrl());
+    printInfo('Dry run mode - configuration that would be written:');
+    console.log(`\n${JSON.stringify(liteConfig, null, 2)}\n`);
+  } else {
+    const configPath = getExistingLiteConfigPath();
+    const configExists = existsSync(configPath);
+
+    if (configExists && !config.reset) {
+      printInfo(
+        `Configuration already exists at ${configPath}. ` +
+          'Use --reset to overwrite.',
+      );
+    } else {
+      const liteResult = writeLiteConfig(
+        config,
+        configExists ? configPath : undefined,
+      );
+      if (
+        !handleStepResult(
+          liteResult,
+          configExists ? 'Config reset' : 'Config written',
+        )
+      )
+        return 1;
+    }
+  }
+
+  // Install custom skills if requested
+  if (config.installCustomSkills) {
+    printStep(step++, totalSteps, 'Synchronizing custom skills...');
+    if (config.dryRun) {
+      printInfo('Dry run mode - would synchronize custom skills:');
+      for (const skill of CUSTOM_SKILLS) {
+        printInfo(`  - ${skill.name}`);
+      }
+    } else {
+      try {
+        const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
+        const result = syncBundledSkillsFromPackage(packageRoot);
+        const categorizedSkipped = new Set([
+          ...result.staged,
+          ...result.adopted,
+          ...result.customized,
+        ]);
+        const preservedSkills = result.skippedExisting.filter(
+          (skill) => !categorizedSkipped.has(skill),
+        );
+
+        if (result.installed.length > 0) {
+          for (const skill of result.installed) {
+            printSuccess(`Installed/Updated: ${skill}`);
+          }
+        }
+        if (preservedSkills.length > 0) {
+          for (const skill of preservedSkills) {
+            printInfo(`Skipped/Preserved: ${skill}`);
+          }
+        }
+        if (result.failed.length > 0) {
+          for (const skill of result.failed) {
+            if (skill === '__lock__') {
+              printError('Lock acquisition failed');
+            } else if (skill === '__manifest__') {
+              printError('Manifest write failed');
+            } else {
+              printError(`Failed: ${skill}`);
+            }
+          }
+        }
+        if (result.staged.length > 0) {
+          for (const skill of result.staged) {
+            printInfo(`Staged for review: ${skill}`);
+          }
+        }
+        if (result.adopted.length > 0) {
+          for (const skill of result.adopted) {
+            printInfo(`Adopted: ${skill}`);
+          }
+        }
+        if (result.customized.length > 0) {
+          for (const skill of result.customized) {
+            printInfo(`Customized: ${skill}`);
+          }
+        }
+
+        const realFailed = result.failed.filter(
+          (skill) => skill !== '__lock__' && skill !== '__manifest__',
+        );
+        printSuccess(
+          `Skill synchronization complete: ` +
+            `${result.installed.length} installed/updated, ` +
+            `${preservedSkills.length} skipped/preserved, ` +
+            `${result.staged.length} staged, ` +
+            `${result.adopted.length} adopted, ` +
+            `${result.customized.length} customized, ` +
+            `${realFailed.length} failed.`,
+        );
+      } catch (err) {
+        printError(`Failed to synchronize custom skills: ${err}`);
+      }
+    }
+  }
+
+  const statusMsg = isUpdate
+    ? 'Configuration updated!'
+    : 'Installation complete!';
+  console.log(`${SYMBOLS.check} ${BOLD}${GREEN}${statusMsg}${RESET}`);
+  console.log();
+  console.log(`${BOLD}Next steps:${RESET}`);
+  console.log();
+
+  const configPath = getExistingLiteConfigPath();
+
+  console.log('  1. Log in to the provider(s) you want to use:');
+  console.log(`     ${BLUE}$ opencode auth login${RESET}`);
+  console.log();
+  console.log('  2. Refresh the models OpenCode can see:');
+  console.log(`     ${BLUE}$ opencode models --refresh${RESET}`);
+  console.log();
+  console.log('  3. Review your generated config:');
+  console.log(`     ${BLUE}${configPath}${RESET}`);
+  console.log();
+  console.log('  4. Start OpenCode:');
+  if (backgroundSubagents.enabledNow) {
+    console.log(`     ${BLUE}$ opencode${RESET}`);
+  } else if (backgroundSubagents.configuredTarget) {
+    console.log(
+      `     ${BLUE}$ source ${backgroundSubagents.configuredTarget}${RESET}`,
+    );
+    console.log(`     ${BLUE}$ opencode${RESET}`);
+    console.log(
+      `     ${DIM}Or restart your terminal before running opencode.${RESET}`,
+    );
+  } else {
+    console.log(
+      `     ${BLUE}$ OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true opencode${RESET}`,
+    );
+  }
+  console.log();
+  console.log('  5. Verify the agents are responding:');
+  console.log(`     ${BLUE}> ping all agents${RESET}`);
+  console.log();
+
+  const modelsInfo =
+    config.preset && config.preset !== 'openai'
+      ? `Generated OpenAI and OpenCode Go presets; ${config.preset} is active.`
+      : 'Generated OpenAI and OpenCode Go presets; OpenAI is active by default.';
+  console.log(`${modelsInfo}`);
+  console.log('For installation, diagnostics, and removal instructions, see:');
+  console.log(`  ${BLUE}docs/installation.md${RESET}`);
+  console.log();
+
+  return 0;
+}
+
+export async function install(args: InstallArgs): Promise<number> {
+  const config: InstallConfig = {
+    hasTmux: false,
+    installCustomSkills: args.skills === 'yes',
+    preset: args.preset,
+    dryRun: args.dryRun,
+    reset: args.reset ?? false,
+    backgroundSubagents: args.backgroundSubagents ?? (args.tui ? 'ask' : 'no'),
+    backgroundSubagentsTarget: args.backgroundSubagentsTarget,
+  };
+
+  return runInstall(config);
+}

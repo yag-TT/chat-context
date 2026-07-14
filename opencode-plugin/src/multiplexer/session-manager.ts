@@ -1,0 +1,772 @@
+import type { PluginInput } from '@opencode-ai/plugin';
+import { POLL_INTERVAL_BACKGROUND_MS } from '../config';
+import type { MultiplexerConfig } from '../config/schema';
+import {
+  getMultiplexer,
+  isServerRunning,
+  type Multiplexer,
+} from '../multiplexer';
+import type { BackgroundJobState } from '../utils/background-job-board';
+import type { BackgroundJobStore } from '../utils/background-job-store';
+import { log } from '../utils/logger';
+import {
+  CmuxSessionLifecycle,
+  type CmuxSessionLifecycleOptions,
+} from './cmux/session-lifecycle';
+import { CmuxSessionStore } from './cmux/session-state';
+
+type BackgroundJobReader = Pick<
+  BackgroundJobStore,
+  'getState' | 'deferIfRunning' | 'clearDeferredClose'
+>;
+
+interface TrackedSession {
+  sessionId: string;
+  paneId: string;
+  parentId: string;
+  title: string;
+  directory: string;
+  ownerInstanceId: string;
+}
+
+interface KnownSession {
+  parentId: string;
+  title: string;
+  directory: string;
+}
+
+interface SharedSessionState {
+  sessions: Map<string, TrackedSession>;
+  knownSessions: Map<string, KnownSession>;
+  spawningSessions: Set<string>;
+  closingSessions: Map<string, Promise<void>>;
+}
+
+interface SessionEvent {
+  type: string;
+  properties?: {
+    info?: {
+      id?: string;
+      parentID?: string;
+      title?: string;
+      directory?: string;
+      sessionID?: string;
+    };
+    part?: { sessionID?: string };
+    sessionID?: string;
+    status?: { type: string };
+  };
+}
+
+type CloseReason = 'idle' | 'deleted';
+
+const SHARED_STATE_KEY = Symbol.for(
+  'opencode-multi-agent.multiplexer-session-manager.state',
+);
+
+function getSharedState(): SharedSessionState {
+  const globalWithState = globalThis as typeof globalThis & {
+    [SHARED_STATE_KEY]?: SharedSessionState;
+  };
+
+  globalWithState[SHARED_STATE_KEY] ??= {
+    sessions: new Map(),
+    knownSessions: new Map(),
+    spawningSessions: new Set(),
+    closingSessions: new Map(),
+  };
+
+  return globalWithState[SHARED_STATE_KEY];
+}
+
+export function resetMultiplexerSessionManagerState(): void {
+  const state = getSharedState();
+  state.sessions.clear();
+  state.knownSessions.clear();
+  state.spawningSessions.clear();
+  state.closingSessions.clear();
+  new CmuxSessionStore().resetForTests();
+}
+
+export type MultiplexerSessionManagerOptions = CmuxSessionLifecycleOptions;
+
+function validServerUrl(value: unknown): string | null {
+  if (typeof value !== 'string' && !(value instanceof URL)) return null;
+  try {
+    const url = new URL(value.toString());
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function clientBaseUrl(client: unknown): string | null {
+  try {
+    if (!client || typeof client !== 'object' || !('_client' in client))
+      return null;
+    const internal = client._client;
+    if (!internal || typeof internal !== 'object' || !('getConfig' in internal))
+      return null;
+    const getConfig = internal.getConfig;
+    if (typeof getConfig !== 'function') return null;
+    const config: unknown = getConfig.call(internal);
+    if (!config || typeof config !== 'object' || !('baseUrl' in config))
+      return null;
+    return validServerUrl(config.baseUrl);
+  } catch {
+    return null;
+  }
+}
+
+function createServerUrlResolver(ctx: PluginInput): () => string | null {
+  return () => {
+    try {
+      const serverUrl = validServerUrl(ctx.serverUrl);
+      if (serverUrl) return serverUrl;
+    } catch {}
+    try {
+      return clientBaseUrl(ctx.client);
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * Tracks child sessions and spawns/closes multiplexer panes for them.
+ *
+ * Uses session.status events for completion detection instead of polling,
+ * with polling kept as a fallback for reliability.
+ */
+export class MultiplexerSessionManager {
+  private instanceId = Math.random().toString(36).slice(2, 8);
+  private readonly resolveServerUrl: () => string | null;
+  private directory: string;
+  private multiplexer: Multiplexer | null = null;
+  private sessions: SharedSessionState['sessions'];
+  private knownSessions: SharedSessionState['knownSessions'];
+  private spawningSessions: SharedSessionState['spawningSessions'];
+  private closingSessions: SharedSessionState['closingSessions'];
+  private pollInterval?: ReturnType<typeof setInterval>;
+  private enabled = false;
+  private cmuxLifecycle?: CmuxSessionLifecycle;
+
+  constructor(
+    ctx: PluginInput,
+    config: MultiplexerConfig,
+    private readonly backgroundJobBoard?: BackgroundJobReader,
+    options: MultiplexerSessionManagerOptions = {},
+  ) {
+    const sharedState = getSharedState();
+    this.sessions = sharedState.sessions;
+    this.knownSessions = sharedState.knownSessions;
+    this.spawningSessions = sharedState.spawningSessions;
+    this.closingSessions = sharedState.closingSessions;
+
+    this.directory = ctx.directory;
+    this.resolveServerUrl = createServerUrlResolver(ctx);
+
+    this.multiplexer = getMultiplexer(config);
+    this.enabled =
+      config.type !== 'none' &&
+      this.multiplexer !== null &&
+      this.multiplexer.isInsideSession();
+    if (this.enabled && this.multiplexer?.type === 'cmux') {
+      this.cmuxLifecycle = new CmuxSessionLifecycle(
+        this.instanceId,
+        this.multiplexer,
+        this.resolveServerUrl,
+        this.directory,
+        this.backgroundJobBoard,
+        options,
+      );
+    }
+
+    log('[multiplexer-session-manager] initialized', {
+      instanceId: this.instanceId,
+      enabled: this.enabled,
+      type: config.type,
+      serverUrl: 'dynamic',
+      trackedSessions: this.sessions.size,
+      knownSessions: this.knownSessions.size,
+    });
+  }
+
+  async onSessionCreated(event: SessionEvent): Promise<void> {
+    if (this.cmuxLifecycle) return this.cmuxLifecycle.onSessionCreated(event);
+    if (!this.enabled || !this.multiplexer) return;
+    if (event.type !== 'session.created') return;
+
+    const info = event.properties?.info;
+    if (!info?.id || !info?.parentID) {
+      return;
+    }
+
+    const sessionId = info.id;
+    const parentId = info.parentID;
+    const title = info.title ?? 'Subagent';
+    const directory = info.directory ?? this.directory;
+
+    if (this.isTrackedOrSpawning(sessionId)) {
+      log('[multiplexer-session-manager] session already tracked or spawning', {
+        instanceId: this.instanceId,
+        sessionId,
+      });
+      return;
+    }
+
+    const closing = this.closingSessions.get(sessionId);
+    if (closing) await closing;
+
+    if (this.isTrackedOrSpawning(sessionId)) return;
+
+    this.knownSessions.set(sessionId, {
+      parentId,
+      title,
+      directory,
+    });
+
+    this.spawningSessions.add(sessionId);
+
+    try {
+      const serverUrl = this.resolveServerUrl();
+      if (!serverUrl) {
+        log(
+          '[multiplexer-session-manager] no valid server URL, skipping spawn',
+          {
+            instanceId: this.instanceId,
+            sessionId,
+          },
+        );
+        return;
+      }
+      const serverRunning = await isServerRunning(serverUrl);
+      if (!serverRunning) {
+        log('[multiplexer-session-manager] server not running, skipping', {
+          instanceId: this.instanceId,
+          serverUrl,
+        });
+        return;
+      }
+
+      if (this.closingSessions.has(sessionId) || this.sessions.has(sessionId)) {
+        return;
+      }
+
+      log(
+        '[multiplexer-session-manager] child session created, spawning pane',
+        {
+          sessionId,
+          parentId,
+          title,
+          instanceId: this.instanceId,
+        },
+      );
+
+      const paneResult = await this.multiplexer
+        .spawnPane(sessionId, title, serverUrl, directory)
+        .catch((err) => {
+          log('[multiplexer-session-manager] failed to spawn pane', {
+            instanceId: this.instanceId,
+            error: String(err),
+          });
+          return { success: false, paneId: undefined };
+        });
+
+      if (!paneResult.success || !paneResult.paneId) return;
+
+      if (
+        !this.knownSessions.has(sessionId) ||
+        this.closingSessions.has(sessionId)
+      ) {
+        await this.multiplexer.closePane(paneResult.paneId).catch((err) =>
+          log(
+            '[multiplexer-session-manager] closing stale spawned pane failed',
+            {
+              sessionId,
+              paneId: paneResult.paneId,
+              instanceId: this.instanceId,
+              error: String(err),
+            },
+          ),
+        );
+        return;
+      }
+
+      this.sessions.set(sessionId, {
+        sessionId,
+        paneId: paneResult.paneId,
+        parentId,
+        title,
+        directory,
+        ownerInstanceId: this.instanceId,
+      });
+
+      log('[multiplexer-session-manager] pane spawned', {
+        instanceId: this.instanceId,
+        sessionId,
+        paneId: paneResult.paneId,
+      });
+
+      this.startPolling();
+    } finally {
+      this.spawningSessions.delete(sessionId);
+    }
+  }
+
+  async onSessionStatus(event: SessionEvent): Promise<void> {
+    if (this.cmuxLifecycle) return this.cmuxLifecycle.onSessionStatus(event);
+    if (!this.enabled) return;
+
+    if (event.type === 'session.idle') {
+      const sessionId = event.properties?.sessionID;
+      if (!sessionId) return;
+
+      log('[multiplexer-session-manager] session idle event received', {
+        instanceId: this.instanceId,
+        sessionId,
+        tracked: this.sessions.has(sessionId),
+        known: this.knownSessions.has(sessionId),
+        ownerInstanceId: this.sessions.get(sessionId)?.ownerInstanceId,
+        backgroundJobState: this.backgroundJobState(sessionId),
+      });
+
+      await this.closeSession(sessionId, 'idle');
+      return;
+    }
+
+    if (event.type !== 'session.status') return;
+
+    const sessionId = event.properties?.sessionID;
+    if (!sessionId) return;
+
+    const statusType = event.properties?.status?.type;
+
+    if (statusType === 'idle') {
+      log('[multiplexer-session-manager] session status idle received', {
+        instanceId: this.instanceId,
+        sessionId,
+        tracked: this.sessions.has(sessionId),
+        known: this.knownSessions.has(sessionId),
+        ownerInstanceId: this.sessions.get(sessionId)?.ownerInstanceId,
+        backgroundJobState: this.backgroundJobState(sessionId),
+      });
+      await this.closeSession(sessionId, 'idle');
+      return;
+    }
+
+    if (statusType) {
+      if (statusType !== 'busy') {
+        this.backgroundJobBoard?.clearDeferredClose(sessionId);
+        return;
+      }
+
+      log('[multiplexer-session-manager] session busy event received', {
+        instanceId: this.instanceId,
+        sessionId,
+        tracked: this.sessions.has(sessionId),
+        known: this.knownSessions.has(sessionId),
+        ownerInstanceId: this.sessions.get(sessionId)?.ownerInstanceId,
+        backgroundJobState: this.backgroundJobState(sessionId),
+      });
+      await this.respawnIfKnown(sessionId);
+    }
+  }
+
+  async onSessionDeleted(event: SessionEvent): Promise<void> {
+    if (this.cmuxLifecycle) return this.cmuxLifecycle.onSessionDeleted(event);
+    if (!this.enabled) return;
+    if (event.type !== 'session.deleted') return;
+
+    const sessionId = this.getSessionId(event);
+    if (!sessionId) return;
+
+    log('[multiplexer-session-manager] session deleted, closing pane', {
+      instanceId: this.instanceId,
+      sessionId,
+      tracked: this.sessions.has(sessionId),
+      known: this.knownSessions.has(sessionId),
+      ownerInstanceId: this.sessions.get(sessionId)?.ownerInstanceId,
+      backgroundJobState: this.backgroundJobState(sessionId),
+    });
+
+    await this.closeSession(sessionId, 'deleted');
+  }
+
+  private startPolling(): void {
+    if (this.pollInterval) return;
+
+    this.pollInterval = setInterval(
+      () => this.pollSessions(),
+      POLL_INTERVAL_BACKGROUND_MS,
+    );
+    log('[multiplexer-session-manager] polling started', {
+      instanceId: this.instanceId,
+    });
+  }
+
+  private stopPolling(): void {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = undefined;
+      log('[multiplexer-session-manager] polling stopped', {
+        instanceId: this.instanceId,
+      });
+    }
+  }
+
+  private async pollSessions(): Promise<void> {
+    if (this.cmuxLifecycle) return this.cmuxLifecycle.pollOnce();
+    if (this.sessions.size === 0) {
+      this.stopPolling();
+      return;
+    }
+
+    try {
+      const allStatuses = await this.fetchSessionStatuses();
+
+      const sessionsToClose: string[] = [];
+
+      for (const [sessionId, tracked] of this.sessions.entries()) {
+        if (tracked.ownerInstanceId !== this.instanceId) {
+          log('[multiplexer-session-manager] skipping non-owner poll close', {
+            instanceId: this.instanceId,
+            ownerInstanceId: tracked.ownerInstanceId,
+            sessionId,
+            paneId: tracked.paneId,
+          });
+          continue;
+        }
+
+        const status = allStatuses[sessionId];
+        if (!status) continue;
+
+        if (status.type !== 'idle') {
+          this.backgroundJobBoard?.clearDeferredClose(sessionId);
+          continue;
+        }
+
+        sessionsToClose.push(sessionId);
+      }
+
+      for (const sessionId of sessionsToClose) {
+        await this.closeSession(sessionId, 'idle');
+      }
+    } catch (err) {
+      log('[multiplexer-session-manager] poll error', { error: String(err) });
+    }
+  }
+
+  private async fetchSessionStatuses(): Promise<
+    Record<string, { type: string }>
+  > {
+    const serverUrl = this.resolveServerUrl();
+    if (!serverUrl) {
+      log('[multiplexer-session-manager] no valid server URL, skipping poll', {
+        instanceId: this.instanceId,
+      });
+      return {};
+    }
+    const url = new URL('/session/status', serverUrl);
+    const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+
+    if (!response.ok) {
+      throw new Error(
+        `session status request failed: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    const body = await response.text();
+    if (body.trim() === '') {
+      throw new Error('session status response was empty');
+    }
+
+    try {
+      return JSON.parse(body) as Record<string, { type: string }>;
+    } catch (err) {
+      throw new Error(`session status response was not valid JSON: ${err}`);
+    }
+  }
+
+  private async closeSession(
+    sessionId: string,
+    reason: CloseReason,
+    skipPolicyCheck = false,
+  ): Promise<void> {
+    if (reason === 'deleted') {
+      this.knownSessions.delete(sessionId);
+      this.backgroundJobBoard?.clearDeferredClose(sessionId);
+    }
+
+    const existingClose = this.closingSessions.get(sessionId);
+    if (existingClose) return existingClose;
+
+    const tracked = this.sessions.get(sessionId);
+    if (!tracked || !this.multiplexer) {
+      log('[multiplexer-session-manager] close skipped; session not tracked', {
+        instanceId: this.instanceId,
+        sessionId,
+        reason,
+        tracked: !!tracked,
+        hasMultiplexer: !!this.multiplexer,
+      });
+      return;
+    }
+
+    if (reason !== 'deleted' && tracked.ownerInstanceId !== this.instanceId) {
+      log('[multiplexer-session-manager] close skipped; non-owner instance', {
+        instanceId: this.instanceId,
+        ownerInstanceId: tracked.ownerInstanceId,
+        sessionId,
+        paneId: tracked.paneId,
+        reason,
+      });
+      return;
+    }
+    if (reason === 'deleted' && tracked.ownerInstanceId !== this.instanceId) {
+      log('[multiplexer-session-manager] closing deleted pane as non-owner', {
+        instanceId: this.instanceId,
+        ownerInstanceId: tracked.ownerInstanceId,
+        sessionId,
+        paneId: tracked.paneId,
+        reason,
+      });
+    }
+
+    if (
+      reason === 'idle' &&
+      !skipPolicyCheck &&
+      !this.shouldCloseNow(sessionId)
+    ) {
+      log(
+        '[multiplexer-session-manager] close skipped; background job running',
+        {
+          instanceId: this.instanceId,
+          sessionId,
+          paneId: tracked.paneId,
+          reason,
+          backgroundJobState: this.backgroundJobState(sessionId),
+        },
+      );
+      return;
+    }
+
+    this.sessions.delete(sessionId);
+
+    log('[multiplexer-session-manager] closing session pane', {
+      instanceId: this.instanceId,
+      sessionId,
+      paneId: tracked.paneId,
+      reason,
+      backgroundJobState: this.backgroundJobState(sessionId),
+      parentId: tracked.parentId,
+      title: tracked.title,
+    });
+
+    const closePromise: Promise<void> = this.multiplexer
+      .closePane(tracked.paneId)
+      .then(() => undefined)
+      .catch((err) =>
+        log('[multiplexer-session-manager] failed to close session pane', {
+          instanceId: this.instanceId,
+          sessionId,
+          paneId: tracked.paneId,
+          reason,
+          error: String(err),
+        }),
+      )
+      .finally(() => {
+        this.closingSessions.delete(sessionId);
+        this.updatePolling();
+      });
+
+    this.closingSessions.set(sessionId, closePromise);
+    await closePromise;
+  }
+
+  private async respawnIfKnown(sessionId: string): Promise<void> {
+    if (!this.enabled || !this.multiplexer) return;
+    const closing = this.closingSessions.get(sessionId);
+    if (closing) await closing;
+
+    if (this.isTrackedOrSpawning(sessionId)) {
+      return;
+    }
+
+    const known = this.knownSessions.get(sessionId);
+    if (!known) return;
+
+    this.spawningSessions.add(sessionId);
+
+    try {
+      const serverUrl = this.resolveServerUrl();
+      if (!serverUrl) {
+        log(
+          '[multiplexer-session-manager] no valid server URL, skipping respawn',
+          {
+            instanceId: this.instanceId,
+            sessionId,
+          },
+        );
+        return;
+      }
+      const serverRunning = await isServerRunning(serverUrl);
+      if (!serverRunning) {
+        log(
+          '[multiplexer-session-manager] server not running, skipping busy respawn',
+          {
+            instanceId: this.instanceId,
+            serverUrl,
+            sessionId,
+          },
+        );
+        return;
+      }
+
+      if (this.sessions.has(sessionId) || this.closingSessions.has(sessionId)) {
+        return;
+      }
+
+      log(
+        '[multiplexer-session-manager] child session busy again, respawning pane',
+        {
+          instanceId: this.instanceId,
+          sessionId,
+          parentId: known.parentId,
+          title: known.title,
+        },
+      );
+
+      const paneResult = await this.multiplexer
+        .spawnPane(sessionId, known.title, serverUrl, known.directory)
+        .catch((err) => {
+          log('[multiplexer-session-manager] failed to respawn pane', {
+            instanceId: this.instanceId,
+            error: String(err),
+          });
+          return { success: false, paneId: undefined };
+        });
+
+      if (!paneResult.success || !paneResult.paneId) return;
+
+      if (
+        !this.knownSessions.has(sessionId) ||
+        this.closingSessions.has(sessionId)
+      ) {
+        await this.multiplexer.closePane(paneResult.paneId).catch((err) =>
+          log(
+            '[multiplexer-session-manager] closing stale respawned pane failed',
+            {
+              instanceId: this.instanceId,
+              sessionId,
+              paneId: paneResult.paneId,
+              error: String(err),
+            },
+          ),
+        );
+        return;
+      }
+
+      this.sessions.set(sessionId, {
+        sessionId,
+        paneId: paneResult.paneId,
+        parentId: known.parentId,
+        title: known.title,
+        directory: known.directory,
+        ownerInstanceId: this.instanceId,
+      });
+      this.backgroundJobBoard?.clearDeferredClose(sessionId);
+
+      log('[multiplexer-session-manager] pane respawned on busy', {
+        instanceId: this.instanceId,
+        sessionId,
+        paneId: paneResult.paneId,
+      });
+
+      this.startPolling();
+    } finally {
+      this.spawningSessions.delete(sessionId);
+    }
+  }
+
+  private isTrackedOrSpawning(sessionId: string): boolean {
+    return this.sessions.has(sessionId) || this.spawningSessions.has(sessionId);
+  }
+
+  private updatePolling(): void {
+    if (this.sessions.size > 0 || this.closingSessions.size > 0) {
+      this.startPolling();
+    } else {
+      this.stopPolling();
+    }
+  }
+
+  private getSessionId(event: SessionEvent): string | undefined {
+    return event.properties?.info?.id || event.properties?.sessionID;
+  }
+
+  private backgroundJobState(
+    sessionId: string,
+  ): BackgroundJobState | undefined {
+    return this.backgroundJobBoard?.getState(sessionId);
+  }
+
+  private shouldCloseNow(sessionId: string): boolean {
+    return this.backgroundJobBoard?.deferIfRunning(sessionId) ?? true;
+  }
+
+  async closeSessionFromCoordinator(sessionId: string): Promise<void> {
+    if (this.cmuxLifecycle)
+      return this.cmuxLifecycle.closeSessionFromCoordinator(sessionId);
+    if (!this.enabled) return;
+    // Coordinator already vetted lifecycle policy; skip re-check
+    // ponytail: theoretical race if new job starts between coordinator's
+    // retryDeferredClose() and this call, but session IDs are unique per launch
+    await this.closeSession(sessionId, 'idle', true);
+  }
+
+  async cleanup(): Promise<void> {
+    if (this.cmuxLifecycle) return this.cmuxLifecycle.cleanup();
+    this.stopPolling();
+
+    if (this.closingSessions.size > 0) {
+      await Promise.all(this.closingSessions.values());
+    }
+
+    if (this.sessions.size > 0 && this.multiplexer) {
+      log('[multiplexer-session-manager] closing all panes', {
+        count: this.sessions.size,
+      });
+      const multiplexer = this.multiplexer;
+      const closePromises = Array.from(this.sessions.values()).map((s) =>
+        multiplexer.closePane(s.paneId).catch((err) =>
+          log('[multiplexer-session-manager] cleanup error for pane', {
+            paneId: s.paneId,
+            error: String(err),
+          }),
+        ),
+      );
+      await Promise.all(closePromises);
+      this.sessions.clear();
+    }
+
+    this.knownSessions.clear();
+    this.spawningSessions.clear();
+    this.closingSessions.clear();
+    // ponytail: deferred state lives in coordinator, not here
+    // Note: coordinator has same lifetime as plugin, so no explicit cleanup needed
+
+    log('[multiplexer-session-manager] cleanup complete');
+  }
+
+  async cleanupOnInstanceDisposed(): Promise<void> {
+    if (this.cmuxLifecycle) await this.cmuxLifecycle.cleanup();
+  }
+}
+
+/**
+ * @deprecated Use MultiplexerSessionManager instead
+ */
+export const TmuxSessionManager = MultiplexerSessionManager;
