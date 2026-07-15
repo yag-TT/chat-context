@@ -64,6 +64,7 @@ import {
 } from './utils';
 import { isPluginDisabledByEnv } from './utils/env';
 import { initLogger, log } from './utils/logger';
+import { migrateProjectStateDirectory } from './utils/project-state-migration';
 import { SubagentDepthTracker } from './utils/subagent-depth';
 import { collapseSystemInPlace } from './utils/system-collapse';
 
@@ -126,6 +127,29 @@ const OpenCodeMultiAgent: Plugin = async (ctx) => {
   if (isPluginDisabledByEnv()) {
     log('[plugin] disabled by OPENCODE_MULTI_AGENT_DISABLE');
     return {};
+  }
+
+  const stateMigration = await migrateProjectStateDirectory(ctx.directory);
+  if (stateMigration.status === 'migrated') {
+    log('[project-state] migrated legacy directory', {
+      directory: ctx.directory,
+      updatedIgnoreFiles: stateMigration.updatedIgnoreFiles,
+    });
+  } else if (stateMigration.updatedIgnoreFiles.length > 0) {
+    log('[project-state] updated legacy ignore paths', {
+      directory: ctx.directory,
+      updatedIgnoreFiles: stateMigration.updatedIgnoreFiles,
+    });
+  }
+  if (
+    stateMigration.status === 'conflict' ||
+    stateMigration.status === 'failed' ||
+    stateMigration.warnings.length > 0
+  ) {
+    log('[project-state] migration warning', {
+      directory: ctx.directory,
+      ...stateMigration,
+    });
   }
 
   // Declare variables that must survive the try/catch for the return

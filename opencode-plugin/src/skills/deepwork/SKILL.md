@@ -18,10 +18,10 @@ Required behavior:
 
 - before planning, delegation, or creating a deepwork state file, inspect the
   existing `.gitignore` and `.ignore`; add only missing entries, without
-  duplicates, so `.gitignore` contains `.slim/deepwork/` and `.ignore` contains
-  `!.slim/deepwork/` and `!.slim/deepwork/**`;
+  duplicates, so `.gitignore` contains `.opencode-multi-agent/deepwork/` and `.ignore` contains
+  `!.opencode-multi-agent/deepwork/` and `!.opencode-multi-agent/deepwork/**`;
 - keep OpenCode todos aligned with the active deepwork phase;
-- create and maintain a local markdown progress file under `.slim/deepwork/`;
+- create and maintain a local markdown progress file under `.opencode-multi-agent/deepwork/`;
 - write valuable research findings into that file as confirmed research context
   when they are received and reconciled;
 - draft a plan before implementation;
@@ -66,7 +66,7 @@ After designer work:
 Create a task-specific file such as:
 
 ```text
-.slim/deepwork/<short-task-slug>.md
+.opencode-multi-agent/deepwork/<short-task-slug>.md
 ```
 
 Before creating this file—and before planning or delegation—inspect the existing
@@ -74,13 +74,13 @@ Before creating this file—and before planning or delegation—inspect the exis
 
 ```gitignore
 # .gitignore
-.slim/deepwork/
+.opencode-multi-agent/deepwork/
 ```
 
 ```gitignore
 # .ignore
-!.slim/deepwork/
-!.slim/deepwork/**
+!.opencode-multi-agent/deepwork/
+!.opencode-multi-agent/deepwork/**
 ```
 
 These rules keep deepwork state git-local while allowing OpenCode to read it.

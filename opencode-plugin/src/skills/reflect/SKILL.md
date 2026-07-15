@@ -178,7 +178,7 @@ Use available evidence in this order:
 
 1. Current conversation and explicit user instructions.
 2. Project-local guidance and memories, such as `AGENTS.md`, `.opencode/`,
-   `.slim/`, notes, checkpoints, task progress files, and codemaps.
+   `.opencode-multi-agent/`, notes, checkpoints, task progress files, and codemaps.
 3. Existing skills, commands, agents, prompt overrides, MCP permissions, and
    opencode-multi-agent configuration.
 4. Recent OpenCode logs or session artifacts if they are available and safe to

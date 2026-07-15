@@ -52,7 +52,7 @@ opencode.jsonc
 .agents/
 .out-of-scope/
 skills-lock.json
-.slim/codemap.json
+.opencode-multi-agent/codemap.json
 
 # AI Memory
 .aim/
@@ -92,15 +92,15 @@ wheels/
 captures/
 
 # BEGIN opencode-multi-agent clonedeps
-.slim/clonedeps/repos/
+.opencode-multi-agent/clonedeps/repos/
 # END opencode-multi-agent clonedeps
 
 # BEGIN opencode-multi-agent worktrees
-.slim/worktrees/
-.slim/worktrees.json
+.opencode-multi-agent/worktrees/
+.opencode-multi-agent/worktrees.json
 # END opencode-multi-agent worktrees
 
 # Deepwork session artifacts
-.slim/deepwork/
+.opencode-multi-agent/deepwork/
 .codegraph/
 .worktrees/
