@@ -121,13 +121,30 @@ class ChromeGeminiClient:
         )
 
     async def gemini_web_search(self, query: str, timeout_sec: int = 90) -> GeminiResponse:
-        started = time.monotonic()
-        timeout_ms = max(10_000, min(timeout_sec * 1000, 180_000))
         prompt = (
             "Web検索を使って最新情報を確認し、根拠URLを含めて日本語で簡潔に回答してください。\n"
             "推測と確認済み事実を区別してください。\n\n"
             f"質問: {query}"
         )
+        return await self._gemini_request(
+            prompt, query, max(10, min(timeout_sec, 180))
+        )
+
+    async def gemini_ask(
+        self, prompt: str, context: str = "", timeout_sec: int = 300
+    ) -> GeminiResponse:
+        if not prompt.strip():
+            raise PageInteractionError("prompt must not be empty.")
+        if not 10 <= timeout_sec <= 600:
+            raise PageInteractionError("timeout_sec must be between 10 and 600.")
+        message = prompt if not context else f"{prompt}\n\n<context>\n{context}\n</context>"
+        return await self._gemini_request(message, prompt, timeout_sec)
+
+    async def _gemini_request(
+        self, prompt: str, query: str, timeout_sec: int
+    ) -> GeminiResponse:
+        started = time.monotonic()
+        timeout_ms = timeout_sec * 1000
 
         async with self.page() as page:
             page.set_default_timeout(timeout_ms)
@@ -226,7 +243,7 @@ class ChromeGeminiClient:
           for (const selector of selectors) {
             for (const node of document.querySelectorAll(selector)) {
               const text = (node.innerText || '').trim();
-              if (text.length > 20) values.push(text);
+              if (text.length > 0) values.push(text);
             }
           }
           return values;
@@ -279,9 +296,11 @@ class ChromeGeminiClient:
             await self._raise_if_blocked(page)
             candidates = await self._gemini_response_candidates(page)
             new_candidates = [candidate for candidate in candidates if candidate not in before_set]
-            candidate = new_candidates[-1] if new_candidates else (candidates[-1] if candidates else "")
+            candidate = new_candidates[-1] if new_candidates else ""
 
-            if candidate and candidate == last_answer:
+            generating = await self._gemini_is_generating(page)
+
+            if candidate and candidate == last_answer and not generating:
                 stable_count += 1
             else:
                 stable_count = 0
@@ -293,6 +312,21 @@ class ChromeGeminiClient:
             await asyncio.sleep(1)
 
         raise PageInteractionError("Timed out waiting for Gemini response text to stabilize.")
+
+    async def _gemini_is_generating(self, page: Page) -> bool:
+        selectors = (
+            'button[aria-label*="Stop response" i]',
+            'button[aria-label*="Stop generating" i]',
+            'button[aria-label*="回答を停止"]',
+            'button[aria-label*="生成を停止"]',
+            'button[aria-label*="応答を停止"]',
+            'button[data-test-id="stop-button"]',
+            'button.stop-button',
+        )
+        for selector in selectors:
+            if await page.locator(selector).first.is_visible():
+                return True
+        return False
 
 
 def _elapsed_ms(started: float) -> int:
